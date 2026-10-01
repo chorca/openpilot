@@ -46,28 +46,49 @@ LEAD_DV_ALLOW = 2.0      # m/s, max approach speed over a lead slower than the s
                          #   settles ~6 m); the taper below is what keeps the approach gentle.
 COAST_MIN_SPEED = 2.5    # m/s, below this the car brakes instead of coasting, otherwise the
                          #   coast band would leave it creeping and unable to come to a stop
-# Personality: the car is an automatic, so a step change in the accel request causes
-# kickdown (a second or two of nothing, then a surge). Accel is therefore capped Honda-ACC
-# style and the request is only allowed to ramp up slowly; relaxing decel is preferred over
-# braking: overspeed inside COAST_BAND is absorbed by coasting (no throttle, no brake).
-PERSONALITY_ACCEL_FACTOR = {
-  log.LongitudinalPersonality.relaxed: 0.8,
-  log.LongitudinalPersonality.standard: 0.95,
-  log.LongitudinalPersonality.aggressive: 1.0,
-}
-# Unknown/absent personality must not silently remove the caps
-FALLBACK_ACCEL_FACTOR = 0.8
-FALLBACK_ACCEL_RISE = 0.2
+LAUNCH_SPEED = 2.5       # m/s (~5.5 mph): starting or creeping, not cruising. The rise caps
+                         #   exist for highway kickdown and at a standstill stop the car
+                         #   pulling away at all (suite: "resume from a stop").
+# Personality: the car is an automatic, so a step change in the accel request causes kickdown
+# (a second or two of nothing, then a surge). The request is therefore only allowed to build
+# slowly, and overspeed inside the coast band is absorbed by coasting (no throttle, no brake).
+# The accel ceiling itself stays the car's own curve: capping below it made a clear-road
+# catch-up ask for about half of stock, which the driver feels immediately.
+def personality_name(personality) -> str:
+  """Personality as a name, tolerating both plain ints and capnp enum objects.
+
+  These tables were keyed by the schema-level enum members and looked up with the enum
+  carried on the selfdriveState message. Those do not compare equal, so every lookup missed
+  and silently fell back: the per-personality tuning was dead code and the fallback coast
+  band (2.0 m/s) stopped the brake finishing a stop. Key by name instead.
+  """
+  try:
+    return {0: "aggressive", 1: "standard", 2: "relaxed"}[int(personality)]
+  except (TypeError, ValueError, KeyError):
+    s = str(personality)
+    return s if s in ("aggressive", "standard", "relaxed") else "standard"
+
+
+# Unknown/absent personality must not silently remove the tuning
+FALLBACK_ACCEL_RISE = 0.5
 FALLBACK_COAST_BAND = 2.0
 PERSONALITY_ACCEL_RISE = {        # m/s^3, how fast the accel request may grow
-  log.LongitudinalPersonality.relaxed: 0.2,
-  log.LongitudinalPersonality.standard: 0.3,
-  log.LongitudinalPersonality.aggressive: 0.45,
+  "relaxed": 0.3,
+  "standard": 0.4,
+  "aggressive": 0.5,
 }
+
+
+def accel_rise_limit(v_ego, personality) -> float:
+  """Rise limit for the accel request (m/s^3). Below LAUNCH_SPEED the car is pulling away
+  rather than cruising: use the stock jerk so a standstill launch can ask to move at all."""
+  if v_ego < LAUNCH_SPEED:
+    return float(np.interp(v_ego, A_CRUISE_MAX_BP, J_CRUISE_VALS))
+  return PERSONALITY_ACCEL_RISE.get(personality_name(personality), FALLBACK_ACCEL_RISE)
 PERSONALITY_COAST_BAND = {        # m/s of overspeed handled by coasting instead of braking
-  log.LongitudinalPersonality.relaxed: 2.0,
-  log.LongitudinalPersonality.standard: 1.5,
-  log.LongitudinalPersonality.aggressive: 1.0,
+  "relaxed": 2.0,
+  "standard": 1.5,
+  "aggressive": 1.0,
 }
 RELEASE_RATE = 0.8                # m/s^3, how fast braking may be released (still a ramp)
 LIGHT_BRAKE_KP = 0.45             # per m/s of overspeed beyond the coast band
@@ -80,8 +101,10 @@ LEAD_DREL_FILTER_TAU = 0.3  # s, low-pass on the lead's gap (kept short: a lagge
 LEAD_VLEAD_FILTER_TAU = 0.7 # s, low-pass on the lead's speed (vision lead jitters several m/s)
 LEAD_RESET_JUMP = 10.0   # m, a jump larger than this is a different object: reset the filters
 TARGET_RISE_RATE = 0.5   # m/s^2, how fast the target speed may rise when a lead is lost:
-                         #   without this the target snaps back to the set speed and the car
-                         #   lurches forward the instant the lead flickers out
+                         #   stops a lead flickering out of view from snapping the target (and
+                         #   the command) back to the set speed
+TARGET_RISE_RATE_LAUNCH = 3.0  # m/s^2, the same limit while pulling away: 0.5 m/s^2 needs
+                               #   ~18 s to ask for 20 mph, which reads as refusing to move.
 TARGET_FALL_RATE = 2.0   # m/s^2, how fast it may fall when a lead appears (stay responsive)
 LEAD_LOSS_HOLD = 2.0     # s, keep using the last lead this long when it briefly stops being
                          #   reported, extrapolating the gap; vision leads drop out for a
@@ -137,14 +160,16 @@ def get_cruise_accel(e2e, v_target, v_ego, a_ego, a_cruise_prev, angle_steers, C
                      v_cruise=None):
   """Cruise-speed command, computed outside the MPC (upstream #38367).
 
-  Damped proportional + slow integral on (v_target - v_ego), where v_target is the
-  lead-aware target speed. The damping term uses the *measured* accel: the car's actuator
-  overshoots the requested accel during transients, which is what turned the plain
-  proportional law into a saw-tooth. `integ` is a one-element list holding the integral
-  state, clamped for anti-windup.
+  Damped proportional + slow integral on (v_target - v_ego), where v_target is the lead-aware
+  target speed. The damping uses the *measured* accel - the actuator overshoots the request
+  during transients, which is what turned the plain proportional law into a saw-tooth - and is
+  one-sided (only while a_ego > 0): damping a decelerating car would add acceleration and cancel
+  the brake request, and a law that will not hold a stop is a safety problem. `integ` is a
+  one-element list holding the integral state, clamped for anti-windup.
   """
-  accel_factor = PERSONALITY_ACCEL_FACTOR.get(personality, FALLBACK_ACCEL_FACTOR)
-  max_accel = (ACCEL_MAX if e2e else get_max_accel(v_ego)) * accel_factor
+  _pers = personality_name(personality)
+  max_accel = ACCEL_MAX if e2e else get_max_accel(v_ego)
+  damping = -CRUISE_KD * max(a_ego, 0.0)   # one-sided: never softens a brake request
 
   if not e2e:
     a_total_max = np.interp(v_ego, _A_TOTAL_MAX_BP, _A_TOTAL_MAX_V)
@@ -164,7 +189,11 @@ def get_cruise_accel(e2e, v_target, v_ego, a_ego, a_cruise_prev, angle_steers, C
   #    asks for it and coasting when only the set speed is exceeded.
   err = v_target - v_ego
   err_speed = (v_cruise - v_ego) if v_cruise is not None else err
-  coast_band = PERSONALITY_COAST_BAND.get(personality, FALLBACK_COAST_BAND)
+  coast_band = PERSONALITY_COAST_BAND.get(_pers, FALLBACK_COAST_BAND)
+  if v_cruise is not None and v_cruise <= 1e-3:
+    # explicit stop request: no coasting. The light brake scales with overspeed-minus-band, so
+    # with a band in force it fades out near the band and the car crawls instead of stopping.
+    coast_band = 0.0
 
   if err_speed < 0.:
     overspeed = -err_speed
@@ -173,18 +202,18 @@ def get_cruise_accel(e2e, v_target, v_ego, a_ego, a_cruise_prev, angle_steers, C
       coasting = True
     elif overspeed <= coast_band:
       # creeping below the coast floor: plain proportional braking so the car can still stop
-      a_speed = min(0.0, CRUISE_KP * err_speed + CRUISE_KI * integ[0] - CRUISE_KD * a_ego)
+      a_speed = min(0.0, CRUISE_KP * err_speed + CRUISE_KI * integ[0] + damping)
       coasting = False
     else:
-      a_speed = min(0.0, -min(LIGHT_BRAKE_MAX, LIGHT_BRAKE_KP * (overspeed - coast_band)) - CRUISE_KD * a_ego)
+      a_speed = min(0.0, -min(LIGHT_BRAKE_MAX, LIGHT_BRAKE_KP * (overspeed - coast_band)) + damping)
       coasting = False
   else:
-    a_speed = CRUISE_KP * err_speed + CRUISE_KI * integ[0] - CRUISE_KD * a_ego
+    a_speed = CRUISE_KP * err_speed + CRUISE_KI * integ[0] + damping
     coasting = False
 
   lead_limited = (v_cruise is not None) and (v_target < v_cruise - 1e-6)
   if lead_limited:
-    a_lead = CRUISE_KP_LEAD * err + CRUISE_KI * integ[0] - CRUISE_KD * a_ego
+    a_lead = CRUISE_KP_LEAD * err + CRUISE_KI * integ[0] + damping
     target_accel = min(a_speed, a_lead)
   else:
     target_accel = a_speed
@@ -198,7 +227,7 @@ def get_cruise_accel(e2e, v_target, v_ego, a_ego, a_cruise_prev, angle_steers, C
   # Ramp: releasing the brake may be brisk, but the accel request itself only ever builds
   # slowly — a step up in the request is what makes the automatic kick down and then surge.
   j_fall = float(np.interp(v_ego, A_CRUISE_MAX_BP, J_CRUISE_VALS))
-  j_rise = RELEASE_RATE if a_cruise_prev < 0. else PERSONALITY_ACCEL_RISE.get(personality, FALLBACK_ACCEL_RISE)
+  j_rise = RELEASE_RATE if a_cruise_prev < 0. else accel_rise_limit(v_ego, _pers)
   target_accel = float(np.clip(target_accel, a_cruise_prev - j_fall * dt, a_cruise_prev + j_rise * dt))
 
   return target_accel
@@ -263,7 +292,7 @@ class LongitudinalPlanner:
     v_cruise_initialized = sm['carState'].vCruise != V_CRUISE_UNSET
 
     personality = sm['selfdriveState'].personality
-    accel_factor = PERSONALITY_ACCEL_FACTOR.get(personality, FALLBACK_ACCEL_FACTOR)
+    _pers = personality_name(personality)
 
     long_control_off = sm['controlsState'].longControlState == LongCtrlState.off
     force_slow_decel = sm['controlsState'].forceDecel
@@ -276,7 +305,7 @@ class LongitudinalPlanner:
     # No change cost when user is controlling the speed, or when standstill
     prev_accel_constraint = not (reset_state or sm['carState'].standstill)
 
-    accel_clip = [ACCEL_MIN, get_max_accel(v_ego) * accel_factor]
+    accel_clip = [ACCEL_MIN, get_max_accel(v_ego)]
     steer_angle_without_offset = sm['carState'].steeringAngleDeg - sm['liveParameters'].angleOffsetDeg
     accel_clip = limit_accel_in_turns(v_ego, steer_angle_without_offset, accel_clip, self.CP)
 
@@ -289,7 +318,9 @@ class LongitudinalPlanner:
       self.a_ego_filter.x = sm['carState'].aEgo
       self.lead_seen = False
       self.lead_hold_t = 0.0
-      self.v_target_prev = v_ego
+      # the target speed is NOT reset here: this branch also fires before the cruise speed is
+      # initialised, and pinning the target to the current speed leaves the car unable to ask
+      # to move off. The limiter below bounds it, and the command is clipped to aEgo anyway.
       self.output_a_target_prev = np.clip(sm['carState'].aEgo, accel_clip[0], accel_clip[1])
 
     # Prevent divergence, smooth in current v_ego
@@ -356,10 +387,15 @@ class LongitudinalPlanner:
 
     v_target_raw = get_lead_target_speed(v_cruise, v_ego, lead_d_rel, lead_v_lead,
                                          t_gap=get_T_FOLLOW(personality))
-    # rate-limit the target speed so a lead flickering out of view cannot snap the target
-    # back to the set speed (and the command with it)
-    self.v_target_prev = float(np.clip(v_target_raw, self.v_target_prev - TARGET_FALL_RATE * self.dt,
-                                       self.v_target_prev + TARGET_RISE_RATE * self.dt))
+    # rate-limit the target speed so a lead flickering out of view cannot snap it back to the
+    # set speed. An explicit stop request (set speed zero, e.g. forceDecel) is NOT limited:
+    # it has to bite now, not decay over the seconds a 2 m/s^2 fall limit would take.
+    if v_cruise <= 1e-3:
+      self.v_target_prev = 0.0
+    else:
+      self.v_target_prev = float(np.clip(v_target_raw, self.v_target_prev - TARGET_FALL_RATE * self.dt,
+                                         self.v_target_prev + (TARGET_RISE_RATE if v_ego >= LAUNCH_SPEED
+                                                               else TARGET_RISE_RATE_LAUNCH) * self.dt))
     v_target = self.v_target_prev
     a_ego_filt = self.a_ego_filter.update(sm['carState'].aEgo)
     self.a_cruise = get_cruise_accel(sm['selfdriveState'].experimentalMode, v_target, v_ego, a_ego_filt,
@@ -385,8 +421,8 @@ class LongitudinalPlanner:
     # Never step the accel request UP: the automatic needs the request to build slowly or it
     # kicks down and then surges. Braking is deliberately not rate-limited here (a delayed
     # brake is a safety problem, and the car's own actuator lag already smooths it).
-    j_rise = PERSONALITY_ACCEL_RISE.get(personality, FALLBACK_ACCEL_RISE) * self.dt
-    self.output_a_target_prev = min(output_a_target, self.output_a_target_prev + j_rise)
+    j_rise = accel_rise_limit(v_ego, _pers)
+    self.output_a_target_prev = min(output_a_target, self.output_a_target_prev + j_rise * self.dt)
     self.output_a_target = np.clip(self.output_a_target_prev, accel_clip[0], accel_clip[1])
     # the state must follow what was published: if a transient clip held the output down,
     # recovering from it must not release the accumulated step
