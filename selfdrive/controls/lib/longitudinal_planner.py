@@ -70,21 +70,25 @@ def personality_name(personality) -> str:
 
 
 # Unknown/absent personality must not silently remove the tuning
-FALLBACK_ACCEL_RISE = 0.5
 FALLBACK_COAST_BAND = 2.0
-PERSONALITY_ACCEL_RISE = {        # m/s^3, how fast the accel request may grow
-  "relaxed": 0.3,
-  "standard": 0.4,
-  "aggressive": 0.5,
+PERSONALITY_ACCEL_RISE_SCALE = {  # multiplier on the stock cruise jerk profile
+  # The car's own cruise law ramps the request at J_CRUISE_VALS (1.6 m/s^3 at rest tapering
+  # to 0.6 at highway speed). Absolute caps (0.3 m/s^3 in relaxed) made a re-acceleration
+  # after a slowdown take ~15 s to ask for anything useful - measured on a drive as the
+  # driver taking over with the pedal 4 s after the car started asking. Scaling stock keeps
+  # some kickdown protection without making the car feel dead.
+  "relaxed": 0.8,
+  "standard": 1.0,
+  "aggressive": 1.2,
 }
 
 
 def accel_rise_limit(v_ego, personality) -> float:
-  """Rise limit for the accel request (m/s^3). Below LAUNCH_SPEED the car is pulling away
-  rather than cruising: use the stock jerk so a standstill launch can ask to move at all."""
-  if v_ego < LAUNCH_SPEED:
-    return float(np.interp(v_ego, A_CRUISE_MAX_BP, J_CRUISE_VALS))
-  return PERSONALITY_ACCEL_RISE.get(personality_name(personality), FALLBACK_ACCEL_RISE)
+  """Rise limit for the accel request (m/s^3): the car's own cruise jerk profile, scaled by
+  personality. Below LAUNCH_SPEED the scale is dropped so a standstill launch can ask to move
+  at all."""
+  scale = 1.0 if v_ego < LAUNCH_SPEED else PERSONALITY_ACCEL_RISE_SCALE.get(personality_name(personality), 1.0)
+  return float(np.interp(v_ego, A_CRUISE_MAX_BP, J_CRUISE_VALS)) * scale
 PERSONALITY_COAST_BAND = {        # m/s of overspeed handled by coasting instead of braking
   "relaxed": 2.0,
   "standard": 1.5,
