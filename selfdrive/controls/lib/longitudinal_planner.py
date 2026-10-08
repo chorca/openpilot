@@ -122,6 +122,12 @@ TARGET_RISE_RATE_CLEAR = 3.0   # m/s^2, the same limit with no lead to pace: the
 TARGET_RISE_RATE_LAUNCH = 3.0  # m/s^2, the same limit while pulling away: 0.5 m/s^2 needs
                                #   ~18 s to ask for 20 mph, which reads as refusing to move.
 TARGET_FALL_RATE = 2.0   # m/s^2, how fast it may fall when a lead appears (stay responsive)
+TARGET_FALL_RATE_FAR = 0.5  # m/s^2, the same limit beyond FAR_FALL_GAP of excess gap. Far out the
+                            #   closure has time to do the work, so a few seconds of a bad lead-speed
+                            #   estimate must not yank the target down: on the 2026-10-08 bookmark the
+                            #   vision estimate read 62 -> 56 mph at 119 m and the car dropped to
+                            #   63.8 mph, nearly the lead's own speed, while still 119 m back.
+FAR_FALL_GAP = 30.0      # m of excess gap beyond which the approach is not urgent
 LEAD_LOSS_HOLD = 2.0     # s, keep using the last lead this long when it briefly stops being
                          #   reported, extrapolating the gap; vision leads drop out for a
                          #   second at a time and without this the car surges each time
@@ -434,7 +440,16 @@ class LongitudinalPlanner:
     else:
       pacing_lead = lead_d_rel is not None
       rise = TARGET_RISE_RATE if (pacing_lead and v_ego >= LAUNCH_SPEED) else TARGET_RISE_RATE_CLEAR
-      self.v_target_prev = float(np.clip(v_target_raw, self.v_target_prev - TARGET_FALL_RATE * self.dt,
+      # How fast the target may fall depends on how much gap is left to close, not just on the
+      # situation being a lead: close in it must bite immediately (a cut-in 25 m ahead), far out it
+      # can afford to move slowly, which is what makes it immune to a jittery long-range speed
+      # estimate. A full-speed fall far away is what cost the driver speed on 2026-10-08.
+      if lead_d_rel is None:
+        fall = TARGET_FALL_RATE
+      else:
+        d_excess_now = lead_d_rel - (LEAD_D_STANDSTILL + get_T_FOLLOW(personality) * v_ego)
+        fall = TARGET_FALL_RATE if d_excess_now < FAR_FALL_GAP else TARGET_FALL_RATE_FAR
+      self.v_target_prev = float(np.clip(v_target_raw, self.v_target_prev - fall * self.dt,
                                          self.v_target_prev + rise * self.dt))
     v_target = self.v_target_prev
     a_ego_filt = self.a_ego_filter.update(sm['carState'].aEgo)
