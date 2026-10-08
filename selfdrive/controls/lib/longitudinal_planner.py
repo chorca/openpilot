@@ -322,9 +322,9 @@ class LongitudinalPlanner:
       self.a_ego_filter.x = sm['carState'].aEgo
       self.lead_seen = False
       self.lead_hold_t = 0.0
-      # the target speed is NOT reset here: this branch also fires before the cruise speed is
-      # initialised, and pinning the target to the current speed leaves the car unable to ask
-      # to move off. The limiter below bounds it, and the command is clipped to aEgo anyway.
+      # The target speed is re-seeded further down (after the lead filter): it must not be pinned
+      # here, because this branch also fires before the cruise speed is initialised and pinning
+      # would leave the car unable to ask to move off.
       self.output_a_target_prev = np.clip(sm['carState'].aEgo, accel_clip[0], accel_clip[1])
 
     # Prevent divergence, smooth in current v_ego
@@ -388,6 +388,15 @@ class LongitudinalPlanner:
     else:
       self.lead_seen = False
       lead_d_rel = lead_v_lead = None
+
+    # After a pedal override the driver's speed is legitimate progress toward the set speed:
+    # re-seed the rate-limited target, or the law brakes the car back onto the ramp's schedule.
+    # Measured on the 2026-10-07 evening drive: gas released at 55 mph on a 60 set -> the plan
+    # went +0.9 to -1.9 m/s^2 and gave back 12 mph (median 6.2 mph over its events). Not while a
+    # lead is tracked (a lead-paced target must keep the authority to slow us) and never above the
+    # set speed (an overspeed still has to be corrected).
+    if reset_state and v_cruise_initialized and not lead_tracked:
+      self.v_target_prev = min(v_cruise, max(self.v_target_prev, v_ego))
 
     v_target_raw = get_lead_target_speed(v_cruise, v_ego, lead_d_rel, lead_v_lead,
                                          t_gap=get_T_FOLLOW(personality))
