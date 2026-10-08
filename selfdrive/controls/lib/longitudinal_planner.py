@@ -104,9 +104,11 @@ LEAD_DREL_FILTER_TAU = 0.3  # s, low-pass on the lead's gap (kept short: a lagge
                             #   the closing allowance and turns a gentle approach into throttle)
 LEAD_VLEAD_FILTER_TAU = 0.7 # s, low-pass on the lead's speed (vision lead jitters several m/s)
 LEAD_RESET_JUMP = 10.0   # m, a jump larger than this is a different object: reset the filters
-TARGET_RISE_RATE = 0.5   # m/s^2, how fast the target speed may rise when a lead is lost:
+TARGET_RISE_RATE = 1.0   # m/s^2, how fast the target speed may rise when a lead is lost:
                          #   stops a lead flickering out of view from snapping the target (and
                          #   the command) back to the set speed
+TARGET_RISE_RATE_CLEAR = 3.0   # m/s^2, the same limit with no lead to pace: the protection below
+                               #   only matters when a lead-paced target could snap back
 TARGET_RISE_RATE_LAUNCH = 3.0  # m/s^2, the same limit while pulling away: 0.5 m/s^2 needs
                                #   ~18 s to ask for 20 mph, which reads as refusing to move.
 TARGET_FALL_RATE = 2.0   # m/s^2, how fast it may fall when a lead appears (stay responsive)
@@ -400,15 +402,20 @@ class LongitudinalPlanner:
 
     v_target_raw = get_lead_target_speed(v_cruise, v_ego, lead_d_rel, lead_v_lead,
                                          t_gap=get_T_FOLLOW(personality))
-    # rate-limit the target speed so a lead flickering out of view cannot snap it back to the
-    # set speed. An explicit stop request (set speed zero, e.g. forceDecel) is NOT limited:
-    # it has to bite now, not decay over the seconds a 2 m/s^2 fall limit would take.
+    # Rate-limit the target speed so a lead flickering out of view cannot snap it back to the set
+    # speed. That protection is only owed while a lead is being paced (tracked, or extrapolated
+    # through LEAD_LOSS_HOLD): with a clear road there is nothing to snap back from, and the accel
+    # is bounded by accel_rise_limit and the ceiling anyway, which is what stock does. Applying the
+    # slow rate on a clear road made every pull-away crawl - measured on the launch probe as
+    # 0-50 mph taking 34.4 s against stock's 19.6 s, with the mean request over 10-30 mph at
+    # +0.71 against stock's +1.25. The fall is never limited when a stop is asked for.
     if v_cruise <= 1e-3:
       self.v_target_prev = 0.0
     else:
+      pacing_lead = lead_d_rel is not None
+      rise = TARGET_RISE_RATE if (pacing_lead and v_ego >= LAUNCH_SPEED) else TARGET_RISE_RATE_CLEAR
       self.v_target_prev = float(np.clip(v_target_raw, self.v_target_prev - TARGET_FALL_RATE * self.dt,
-                                         self.v_target_prev + (TARGET_RISE_RATE if v_ego >= LAUNCH_SPEED
-                                                               else TARGET_RISE_RATE_LAUNCH) * self.dt))
+                                         self.v_target_prev + rise * self.dt))
     v_target = self.v_target_prev
     a_ego_filt = self.a_ego_filter.update(sm['carState'].aEgo)
     self.a_cruise = get_cruise_accel(sm['selfdriveState'].experimentalMode, v_target, v_ego, a_ego_filt,
