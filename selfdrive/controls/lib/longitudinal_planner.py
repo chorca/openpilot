@@ -39,7 +39,17 @@ CRUISE_KD_FILTER = 0.5   # s, low-pass on aEgo before it is used for damping
 LEAD_PROB_GATE = 0.5     # modelProb above which a lead is considered real
 LEAD_D_STANDSTILL = 4.0  # m, standstill gap
 LEAD_T_GAP = 1.45        # s, fallback time gap; the live value comes from get_T_FOLLOW(personality)
-LEAD_TAU = 3.0           # s, time allowed to close the remaining gap
+LEAD_TAU = 8.0           # s, time allowed to close the remaining gap (fallback). The taper below
+                         #   spans LEAD_DV_ALLOW * LEAD_TAU metres of excess gap, so this is what
+                         #   decides how early the approach starts easing: at 3 s the allowed closing
+                         #   speed hit its 2 m/s cap after 6 m and the "taper" was a corner, so the
+                         #   car closed flat at 4.5 mph and then stopped dead. Relaxed is squishier
+                         #   (longest taper), aggressive firms up earliest.
+PERSONALITY_LEAD_TAU = {
+  "relaxed": 15.0,
+  "standard": 8.0,
+  "aggressive": 5.0,
+}
 LEAD_DV_ALLOW = 2.0      # m/s, max approach speed over a lead slower than the set speed.
                          #   Too small and the car never closes to its follow distance
                          #   (measured: 0.5 m/s left it 78 m back where the stock planner
@@ -140,7 +150,7 @@ def limit_accel_in_turns(v_ego, angle_steers, a_target, CP):
   return [a_target[0], min(a_target[1], a_x_allowed)]
 
 
-def get_lead_target_speed(v_cruise, v_ego, d_rel, v_lead, t_gap=LEAD_T_GAP):
+def get_lead_target_speed(v_cruise, v_ego, d_rel, v_lead, t_gap=LEAD_T_GAP, tau=LEAD_TAU):
   """Target speed while a lead is tracked: never approach a slower lead faster than
   LEAD_DV_ALLOW, tapering to the lead's own speed as the gap reaches the desired time gap.
 
@@ -157,7 +167,16 @@ def get_lead_target_speed(v_cruise, v_ego, d_rel, v_lead, t_gap=LEAD_T_GAP):
   if not (math.isfinite(d_rel) and math.isfinite(v_lead)) or d_rel <= 0.:
     return v_cruise
   d_safe = LEAD_D_STANDSTILL + t_gap * v_ego
-  allowance = float(np.clip((d_rel - d_safe) / LEAD_TAU, 0.0, LEAD_DV_ALLOW))
+  # - d_safe, the gap we want, so this is exactly the excess we still have to close
+  d_excess = d_rel - d_safe
+  # Closing rate we are willing to carry, as a function of that excess: closing at d_excess/tau
+  # decays the excess with time constant tau, so the approach eases continuously over
+  # LEAD_DV_ALLOW * tau metres instead of holding a flat rate until the last few metres. Far out it
+  # is capped by LEAD_DV_ALLOW, so a large gap is still closed at a useful rate.
+  allowance = float(np.clip(d_excess / tau, 0.0, LEAD_DV_ALLOW))
+  # The current closing rate matters as much as the distance: if we are already closing faster than
+  # the remaining excess justifies, this target falls below the lead's speed and the law brakes
+  # instead of holding the rate until the gap is nearly gone.
   return max(0.0, min(v_cruise, v_lead + allowance))
 
 
@@ -401,7 +420,8 @@ class LongitudinalPlanner:
       self.v_target_prev = min(v_cruise, max(self.v_target_prev, v_ego))
 
     v_target_raw = get_lead_target_speed(v_cruise, v_ego, lead_d_rel, lead_v_lead,
-                                         t_gap=get_T_FOLLOW(personality))
+                                         t_gap=get_T_FOLLOW(personality),
+                                         tau=PERSONALITY_LEAD_TAU.get(_pers, LEAD_TAU))
     # Rate-limit the target speed so a lead flickering out of view cannot snap it back to the set
     # speed. That protection is only owed while a lead is being paced (tracked, or extrapolated
     # through LEAD_LOSS_HOLD): with a clear road there is nothing to snap back from, and the accel
