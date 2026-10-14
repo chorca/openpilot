@@ -38,6 +38,7 @@ CRUISE_KD_FILTER = 0.5   # s, low-pass on aEgo before it is used for damping
 # Lead-aware target speed: while a lead is tracked, the goal is no longer the set speed.
 LEAD_PROB_GATE = 0.5     # modelProb above which a lead is considered real
 LEAD_D_STANDSTILL = 4.0  # m, standstill gap
+CREEP_HOLD_SPEED = 1.0   # m/s: below this we count as stationary for the standstill hold below
 LEAD_T_GAP = 1.45        # s, fallback time gap; the live value comes from get_T_FOLLOW(personality)
 LEAD_TAU = 8.0           # s, time allowed to close the remaining gap (fallback). The taper below
                          #   spans LEAD_DV_ALLOW * LEAD_TAU metres of excess gap, so this is what
@@ -180,6 +181,15 @@ def get_lead_target_speed(v_cruise, v_ego, d_rel, v_lead, t_gap=LEAD_T_GAP, tau=
   # LEAD_DV_ALLOW * tau metres instead of holding a flat rate until the last few metres. Far out it
   # is capped by LEAD_DV_ALLOW, so a large gap is still closed at a useful rate.
   allowance = float(np.clip(d_excess / tau, 0.0, LEAD_DV_ALLOW))
+  # While we are stationary there is nothing to close: the standstill gap is a floor to stay clear
+  # of, not a target to creep up to. Letting the allowance through here held the speed law's output
+  # just above the 0.1 m/s^2 threshold in cruise_should_stop below, so the car never counted as
+  # stopped and sat pushing gently forward instead of holding the brake. On the 2026-10-13 evening
+  # drive (gap ~9 m, lead stopped, car at 0 mph) the request sat at +0.10 and flickered across that
+  # threshold, which the driver felt as the brake being released and reapplied. Pace the car
+  # ahead's own speed instead, so the car still moves off the moment that car does.
+  if v_ego < CREEP_HOLD_SPEED:
+    allowance = min(allowance, max(0.0, v_lead))
   # The current closing rate matters as much as the distance: if we are already closing faster than
   # the remaining excess justifies, this target falls below the lead's speed and the law brakes
   # instead of holding the rate until the gap is nearly gone.
@@ -457,7 +467,13 @@ class LongitudinalPlanner:
                                      self.a_cruise, steer_angle_without_offset, self.CP, self.dt,
                                      accel_coast, self.allow_throttle, self.cruise_integ, personality,
                                      v_cruise)
-    cruise_should_stop = v_ego < self.CP.vEgoStopping and self.a_cruise < 0.1
+    # ...but not while the car ahead is actually moving away from us: then we are about to go, and
+    # the stop state has to clear at once or the car sits braked while the gap opens. (The maneuver
+    # suite's 'resume from a stop' asserts exactly this - it requires a positive request on the same
+    # frame the lead becomes faster than us.)
+    lead_pulling_away = lead_tracked and lead.vLead > v_ego
+    cruise_should_stop = (v_ego < self.CP.vEgoStopping and self.a_cruise < 0.1
+                          and not lead_pulling_away)
 
     # Take the lowest accel of {MPC's lead-driven command, cruise, [e2e]}. Being the
     # minimum means a lead-following command can never be overridden by cruise just
