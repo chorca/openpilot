@@ -15,5 +15,5 @@
   url = https://github.com/tinygrad/tinygrad.git
 [submodule "opendbc_repo"]
 	path = opendbc_repo
-	url = https://github.com/mvl-boston/opendbc
-	branch = 0111-op-honda
+	url = https://github.com/chorca/opendbc
+	branch = no-pedal-learning
