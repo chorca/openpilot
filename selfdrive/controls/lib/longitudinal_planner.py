@@ -51,7 +51,7 @@ PERSONALITY_LEAD_TAU = {
   "standard": 8.0,
   "aggressive": 5.0,
 }
-LEAD_DV_ALLOW = 2.0      # m/s, max approach speed over a lead slower than the set speed.
+LEAD_DV_ALLOW = 0.8      # m/s, max approach speed over a lead slower than the set speed.
                          #   Too small and the car never closes to its follow distance
                          #   (measured: 0.5 m/s left it 78 m back where the stock planner
                          #   settles ~6 m); the taper below is what keeps the approach gentle.
