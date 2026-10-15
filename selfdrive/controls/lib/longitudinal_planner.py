@@ -51,10 +51,6 @@ PERSONALITY_LEAD_TAU = {
   "standard": 8.0,
   "aggressive": 5.0,
 }
-LEAD_AUTHORITY_TAU = 1.5  # s: how far past the gap we want a lead's ability to slow us fades out.
-                          #   At 70 mph that is ~47 m of excess gap - a lead at 100 m with a wanted
-                          #   gap of ~58 m gets almost no say, which is where the speed estimate is
-                          #   worst. Closing the gap restores it, so a real lead still governs.
 LEAD_DV_ALLOW = 0.8      # m/s, max approach speed over a lead slower than the set speed.
                          #   Too small and the car never closes to its follow distance
                          #   (measured: 0.5 m/s left it 78 m back where the stock planner
@@ -197,27 +193,7 @@ def get_lead_target_speed(v_cruise, v_ego, d_rel, v_lead, t_gap=LEAD_T_GAP, tau=
   # The current closing rate matters as much as the distance: if we are already closing faster than
   # the remaining excess justifies, this target falls below the lead's speed and the law brakes
   # instead of holding the rate until the gap is nearly gone.
-  lead_ceiling = max(0.0, min(v_cruise, v_lead + allowance))
-  # Obeying the lead costs nothing when it is faster than us - that only limits acceleration, and
-  # it is what stops the car charging at a car it can see.
-  if lead_ceiling >= v_ego:
-    return lead_ceiling
-  # But when obeying it would mean SLOWING, only do as much as the threat warrants. The further
-  # away the lead, the less of our speed it gets: at the gap we want it has full authority, and it
-  # fades to none over one more cushion's worth of distance. This is what a distant lead gets wrong
-  # hardest - at 100 m the speed estimate is not trustworthy, and a car reported slower than us but
-  # not actually closing is a bad reading, not a threat. Without this the car brakes 8-14 mph on open
-  # road for a car ~100 m ahead (2026-10-14 evening bookmarks), and jerks about on unreliable
-  # detection. Closing on it does the rest: as the gap comes in, authority rises and the response
-  # gets decisive, which is the cut-in case.
-  if d_excess <= 0.0:
-    authority = 1.0
-  else:
-    authority = float(np.clip(1.0 - d_excess / (LEAD_AUTHORITY_TAU * max(v_ego, 1.0)), 0.0, 1.0))
-  # Blend back toward the SET speed, not toward our own: anchoring on our own speed lets the target
-  # drift down with us (measured: still crept 3.6 mph off on a phantom). "A far lead should have
-  # little effect on our speed" means it should fade out to the speed we would otherwise hold.
-  return max(0.0, v_cruise - (v_cruise - lead_ceiling) * authority)
+  return max(0.0, min(v_cruise, v_lead + allowance))
 
 
 def get_cruise_accel(e2e, v_target, v_ego, a_ego, a_cruise_prev, angle_steers, CP, dt,
