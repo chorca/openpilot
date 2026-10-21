@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import os
 import time
 import numpy as np
 
@@ -51,7 +52,11 @@ class Plant:
     from opendbc.car.honda.values import CAR
     from opendbc.car.honda.interface import CarInterface
 
-    self.planner = LongitudinalPlanner(CarInterface.get_non_essential_params(CAR.HONDA_CIVIC), init_v=self.speed)
+    # Which car the harness pretends to be in, so a platform's own longitudinal params
+    # (alt radar, actuator delay, accel limits) are what gets exercised. Defaults to the
+    # upstream choice; set MANEUVER_CAR=HONDA_ODYSSEY_5G_MMR to test the real car.
+    car = os.getenv("MANEUVER_CAR", "HONDA_CIVIC")
+    self.planner = LongitudinalPlanner(CarInterface.get_non_essential_params(getattr(CAR, car)), init_v=self.speed)
 
   @property
   def current_time(self):
@@ -118,10 +123,12 @@ class Plant:
     model.modelV2.meta.disengagePredictions.gasPressProbs = [float(prob_throttle) for _ in range(6)]
 
     control.controlsState.longControlState = LongCtrlState.pid if self.enabled else LongCtrlState.off
+    ss.selfdriveState.enabled = self.enabled
     ss.selfdriveState.experimentalMode = self.e2e
     ss.selfdriveState.personality = self.personality
     control.controlsState.forceDecel = self.force_decel
     car_state.carState.vEgo = float(self.speed)
+    car_state.carState.aEgo = float(self.acceleration)
     car_state.carState.standstill = bool(self.speed < 0.01)
     car_state.carState.vCruise = float(v_cruise * 3.6)
     car_control.carControl.orientationNED = [0., float(pitch), 0.]
