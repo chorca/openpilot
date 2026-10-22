@@ -243,6 +243,9 @@ class LongitudinalMpc:
     self.status = False
     self.crash_cnt = 0.0
     self.solution_status = 0
+    self.v_lead_filt = [None, None]
+    self.d_lead_prev = [None, None]
+    self.lead_hold_cnt = [0, 0]
     # timers
     self.solve_time = 0.0
     self.time_qp_solution = 0.0
@@ -313,25 +316,99 @@ class LongitudinalMpc:
     lead_xv = self.extrapolate_lead(x_lead, v_lead, a_lead, a_lead_tau)
     return lead_xv
 
-  def update(self, radarstate, v_cruise, personality=log.LongitudinalPersonality.standard):
+  def update(self, radarstate, v_cruise, personality=log.LongitudinalPersonality.standard, a_ego=None):
     t_follow = get_T_FOLLOW(personality)
     v_ego = self.x0[1]
+    if a_ego is None:
+      a_ego = self.x0[2]
     self.status = radarstate.leadOne.status or radarstate.leadTwo.status
 
-    lead_xv_0 = self.process_lead(radarstate.leadOne)
-    lead_xv_1 = self.process_lead(radarstate.leadTwo)
+    d_want = t_follow * v_ego + STOP_DISTANCE
+    d_comfort_now = get_safe_obstacle_distance(v_ego, t_follow)
+    lead_xvs = []
+    lead_obstacles = []
+    lead_active_0 = False
+    d_rel_0 = 0.0
 
-    # To estimate a safe distance from a moving lead, we calculate how much stopping
-    # distance that lead needs as a minimum. We can add that to the current distance
-    # and then treat that as a stopped car/obstacle at this new distance.
-    lead_0_obstacle = lead_xv_0[:,0] + get_stopped_equivalence_factor(lead_xv_0[:,1])
-    lead_1_obstacle = lead_xv_1[:,0] + get_stopped_equivalence_factor(lead_xv_1[:,1])
+    for idx, lead in enumerate((radarstate.leadOne, radarstate.leadTwo)):
+      has_lead = lead is not None and lead.status
+      if has_lead:
+        x_lead_raw = lead.dRel
+        v_vis = lead.vLead - (0.95 * max(0.0, a_ego) if not lead.radar else 0.0)
+        if self.v_lead_filt[idx] is None or abs(x_lead_raw - self.d_lead_prev[idx]) > 8.0 or lead.vLead < 5.0 or lead.aLeadK < -0.5:
+          self.v_lead_filt[idx] = v_vis
+        else:
+          eff_tau = 1.8 if v_vis >= self.v_lead_filt[idx] else 0.6
+          alpha = self.dt / (eff_tau + self.dt)
+          self.v_lead_filt[idx] += alpha * (v_vis - self.v_lead_filt[idx])
+          self.v_lead_filt[idx] = min(self.v_lead_filt[idx], v_vis + 0.7)
+        self.d_lead_prev[idx] = x_lead_raw
+        self.lead_hold_cnt[idx] = int(round(2.5 / self.dt))
+        a_lead = 0.0 if (not lead.radar and -0.35 < lead.aLeadK < 0.5) else lead.aLeadK
+        a_lead_tau = max(lead.aLeadTau, _LEAD_ACCEL_TAU)
+        use_lead = True
+      elif self.v_lead_filt[idx] is not None and self.lead_hold_cnt[idx] > 0 and v_ego > 5.0:
+        self.lead_hold_cnt[idx] -= 1
+        self.d_lead_prev[idx] = max(1.0, self.d_lead_prev[idx] + (self.v_lead_filt[idx] - v_ego) * self.dt)
+        x_lead_raw = self.d_lead_prev[idx]
+        a_lead = 0.0
+        a_lead_tau = _LEAD_ACCEL_TAU
+        use_lead = True
+      else:
+        self.v_lead_filt[idx] = None
+        self.d_lead_prev[idx] = None
+        self.lead_hold_cnt[idx] = 0
+        use_lead = False
+
+      if use_lead:
+        if idx == 0:
+          lead_active_0 = True
+          d_rel_0 = x_lead_raw
+        x_lead = x_lead_raw
+        v_lead = self.v_lead_filt[idx]
+      else:
+        x_lead = 50.0
+        v_lead = v_ego + 10.0
+        a_lead = 0.0
+        a_lead_tau = _LEAD_ACCEL_TAU
+
+      min_x_lead = MIN_X_LEAD_FACTOR * (v_ego + v_lead) * (v_ego - v_lead) / (-ACCEL_MIN * 2)
+      x_lead = np.clip(x_lead, min_x_lead, 1e8)
+      v_lead = np.clip(v_lead, 0.0, 1e8)
+      a_lead = np.clip(a_lead, -10., 5.)
+      l_xv = self.extrapolate_lead(x_lead, v_lead, a_lead, a_lead_tau)
+      lead_xvs.append(l_xv)
+
+      if use_lead and v_ego > 6.0 and v_lead > 5.0 and a_lead > -0.5:
+        dv = l_xv[:, 1] - v_ego
+        pos_scale = np.clip((x_lead_raw - 0.45 * d_want) / (0.55 * d_want), 0.35, 1.0)
+        if v_lead > 10.0:
+          match_dist = max(0.0, v_ego - v_lead)**2 / (2.0 * 1.2)
+          eff_excess = x_lead_raw - (d_want + match_dist)
+          neg_scale = float(np.interp(eff_excess, [10.0, 45.0], [1.0, 0.35]))
+        else:
+          neg_scale = 1.0
+        v_eq = np.maximum(0.0, v_ego + np.where(dv >= 0.0, pos_scale * dv, neg_scale * dv))
+        raw_obs = l_xv[:, 0] + get_stopped_equivalence_factor(v_eq)
+        ref_comfort = l_xv[:, 1] * T_IDXS + d_comfort_now
+        obs_excess = raw_obs - ref_comfort
+        max_pos_excess = max(2.0, x_lead_raw - d_want) if x_lead_raw < d_want else 1e8
+        damped_pos_excess = np.minimum(0.30 * np.maximum(0.0, obs_excess), max_pos_excess)
+        obs = np.where(obs_excess > 0.0, ref_comfort + damped_pos_excess, raw_obs)
+        lead_obstacles.append(obs)
+      else:
+        lead_obstacles.append(l_xv[:, 0] + get_stopped_equivalence_factor(l_xv[:, 1]))
+
+    lead_xv_0, lead_xv_1 = lead_xvs
+    lead_0_obstacle, lead_1_obstacle = lead_obstacles
+
+    c_max_a = 0.35 if (lead_active_0 and v_ego > 6.0 and d_rel_0 < 105.0) else CRUISE_MAX_ACCEL
 
     # Fake an obstacle for cruise, this ensures smooth acceleration to set speed
     # when the leads are no factor.
     v_lower = v_ego + (T_IDXS * CRUISE_MIN_ACCEL * 1.05)
     # TODO does this make sense when max_a is negative?
-    v_upper = v_ego + (T_IDXS * CRUISE_MAX_ACCEL * 1.05)
+    v_upper = v_ego + (T_IDXS * c_max_a * 1.05)
     v_cruise_clipped = np.clip(v_cruise * np.ones(N+1), v_lower, v_upper)
     cruise_obstacle = np.cumsum(T_DIFFS * v_cruise_clipped) + get_safe_obstacle_distance(v_cruise_clipped, t_follow)
 
