@@ -244,6 +244,8 @@ class LongitudinalMpc:
     self.crash_cnt = 0.0
     self.solution_status = 0
     self.v_lead_filt = [None, None]
+    self.d_lead_hat = [None, None]
+    self.v_lead_hat = [None, None]
     self.d_lead_prev = [None, None]
     self.lead_hold_cnt = [0, 0]
     # timers
@@ -325,47 +327,86 @@ class LongitudinalMpc:
 
     d_want = t_follow * v_ego + STOP_DISTANCE
     d_comfort_now = get_safe_obstacle_distance(v_ego, t_follow)
+    obs_neutral = v_ego * T_IDXS + d_comfort_now
     lead_xvs = []
     lead_obstacles = []
     lead_active_0 = False
     d_rel_0 = 0.0
+    w_hwy_0 = 0.0
 
     for idx, lead in enumerate((radarstate.leadOne, radarstate.leadTwo)):
       has_lead = lead is not None and lead.status
       if has_lead:
         x_lead_raw = lead.dRel
-        v_vis = lead.vLead - (0.95 * max(0.0, a_ego) if not lead.radar else 0.0)
-        if self.v_lead_filt[idx] is None or abs(x_lead_raw - self.d_lead_prev[idx]) > 8.0 or lead.vLead < 5.0 or lead.aLeadK < -0.5:
-          self.v_lead_filt[idx] = v_vis
+        if self.d_lead_hat[idx] is None or abs(x_lead_raw - self.d_lead_hat[idx]) > 15.0 or lead.vLead < 2.0:
+          self.d_lead_hat[idx] = x_lead_raw
+          self.v_lead_hat[idx] = lead.vLead
         else:
-          eff_tau = 1.8 if v_vis >= self.v_lead_filt[idx] else 0.6
-          alpha = self.dt / (eff_tau + self.dt)
-          self.v_lead_filt[idx] += alpha * (v_vis - self.v_lead_filt[idx])
-          self.v_lead_filt[idx] = min(self.v_lead_filt[idx], v_vis + 0.7)
+          d_pred = self.d_lead_hat[idx] + (self.v_lead_hat[idx] - v_ego) * self.dt
+          max_in = 3.5 if x_lead_raw < 50.0 else 1.2
+          innov = float(np.clip(x_lead_raw - d_pred, -max_in, max_in))
+          self.d_lead_hat[idx] = d_pred + 0.25 * innov
+          v_from_d = max(0.0, self.v_lead_hat[idx] + (0.040 / self.dt) * innov + self.dt * float(np.clip(lead.aLeadK, -3.5, 1.5)))
+          self.v_lead_hat[idx] = 0.85 * v_from_d + 0.15 * lead.vLead
+
+        v_close_err = 0.0
+        if not lead.radar and x_lead_raw < 52.0 and lead.vLead < 21.0 and (v_ego - lead.vLead) > 0.8 and self.v_lead_hat[idx] < lead.vLead - 0.25:
+          close_w = (
+            float(np.interp(x_lead_raw, [38.0, 52.0], [1.0, 0.0]))
+            * float(np.interp(lead.vLead, [17.0, 21.0], [1.0, 0.0]))
+            * float(np.interp(v_ego - lead.vLead, [0.8, 1.8], [0.0, 1.0]))
+            * float(np.interp(v_ego - self.v_lead_hat[idx], [1.5, 3.0], [0.0, 1.0]))
+          )
+          v_close_err = (self.v_lead_hat[idx] - (lead.vLead - 0.25)) * close_w
+
+        w_hwy = 0.0 if lead.radar else (
+          float(np.interp(v_ego, [16.0, 21.0], [0.0, 1.0]))
+          * float(np.interp(lead.vLead, [13.0, 17.0], [0.0, 1.0]))
+          * float(np.interp(lead.aLeadK + 0.5 * v_close_err, [-0.5, -0.15], [0.0, 1.0]))
+        )
+
+        v_corr = lead.vLead - w_hwy * 0.90 * float(np.clip(a_ego, -0.25, 0.8)) + 0.85 * v_close_err
+        if self.v_lead_filt[idx] is None or abs(x_lead_raw - self.d_lead_prev[idx]) > 18.0 or lead.vLead < 8.0:
+          self.v_lead_filt[idx] = v_corr
+        else:
+          eff_tau = 1.40 * w_hwy
+          alpha = self.dt / (eff_tau + self.dt) if eff_tau > 1e-3 else 1.0
+          diff = float(np.clip(v_corr - self.v_lead_filt[idx], -1.2, 1.2)) if w_hwy > 0.5 else (v_corr - self.v_lead_filt[idx])
+          self.v_lead_filt[idx] += alpha * diff
+
         self.d_lead_prev[idx] = x_lead_raw
-        self.lead_hold_cnt[idx] = int(round(2.5 / self.dt))
-        a_lead = 0.0 if (not lead.radar and -0.35 < lead.aLeadK < 0.5) else lead.aLeadK
-        a_lead_tau = max(lead.aLeadTau, _LEAD_ACCEL_TAU)
+        self.lead_hold_cnt[idx] = int(round(2.0 / self.dt))
+        a_lead = min(lead.aLeadK, lead.aLeadK + 0.65 * v_close_err)
+        if not lead.radar and w_hwy > 0.5 and -0.25 < a_lead < 0.40:
+          a_lead = 0.0
+          a_lead_tau = max(lead.aLeadTau, _LEAD_ACCEL_TAU)
+        else:
+          a_lead_tau = lead.aLeadTau
         use_lead = True
-      elif self.v_lead_filt[idx] is not None and self.lead_hold_cnt[idx] > 0 and v_ego > 5.0:
+      elif self.v_lead_filt[idx] is not None and self.lead_hold_cnt[idx] > 0 and v_ego > 15.0:
         self.lead_hold_cnt[idx] -= 1
         self.d_lead_prev[idx] = max(1.0, self.d_lead_prev[idx] + (self.v_lead_filt[idx] - v_ego) * self.dt)
         x_lead_raw = self.d_lead_prev[idx]
         a_lead = 0.0
         a_lead_tau = _LEAD_ACCEL_TAU
+        w_hwy = float(np.interp(v_ego, [16.0, 21.0], [0.0, 1.0]))
         use_lead = True
       else:
         self.v_lead_filt[idx] = None
+        self.d_lead_hat[idx] = None
+        self.v_lead_hat[idx] = None
         self.d_lead_prev[idx] = None
         self.lead_hold_cnt[idx] = 0
+        w_hwy = 0.0
         use_lead = False
 
       if use_lead:
         if idx == 0:
           lead_active_0 = True
           d_rel_0 = x_lead_raw
+          w_hwy_0 = w_hwy
         x_lead = x_lead_raw
-        v_lead = self.v_lead_filt[idx]
+        v_lead = max(0.0, self.v_lead_filt[idx])
       else:
         x_lead = 50.0
         v_lead = v_ego + 10.0
@@ -379,22 +420,24 @@ class LongitudinalMpc:
       l_xv = self.extrapolate_lead(x_lead, v_lead, a_lead, a_lead_tau)
       lead_xvs.append(l_xv)
 
-      if use_lead and v_ego > 6.0 and v_lead > 5.0 and a_lead > -0.5:
+      if use_lead and w_hwy > 0.0:
         dv = l_xv[:, 1] - v_ego
-        pos_scale = np.clip((x_lead_raw - 0.45 * d_want) / (0.55 * d_want), 0.35, 1.0)
-        if v_lead > 10.0:
-          match_dist = max(0.0, v_ego - v_lead)**2 / (2.0 * 1.2)
-          eff_excess = x_lead_raw - (d_want + match_dist)
-          neg_scale = float(np.interp(eff_excess, [10.0, 45.0], [1.0, 0.35]))
-        else:
-          neg_scale = 1.0
+        pos_scale = 1.0 - w_hwy * (1.0 - np.clip((x_lead_raw - 0.45 * d_want) / (0.55 * d_want), 0.35, 1.0))
+        match_dist = max(0.0, v_ego - v_lead)**2 / (2.0 * 1.2)
+        eff_excess = x_lead_raw - (d_want + match_dist)
+        neg_scale = 1.0 - w_hwy * (1.0 - float(np.interp(eff_excess, [12.0, 45.0], [1.0, 0.55])))
         v_eq = np.maximum(0.0, v_ego + np.where(dv >= 0.0, pos_scale * dv, neg_scale * dv))
         raw_obs = l_xv[:, 0] + get_stopped_equivalence_factor(v_eq)
-        ref_comfort = l_xv[:, 1] * T_IDXS + d_comfort_now
-        obs_excess = raw_obs - ref_comfort
+        if x_lead_raw > d_want + 8.0 and self.v_lead_hat[idx] is not None and self.v_lead_hat[idx] > v_ego + 0.5:
+          v_ref = np.maximum(l_xv[:, 1], min(v_ego, self.v_lead_hat[idx]))
+        else:
+          v_ref = l_xv[:, 1]
+        ref_comfort = v_ref * T_IDXS + d_comfort_now
+        obs_delta = raw_obs - ref_comfort
+        pos_gain = 1.0 - 0.70 * w_hwy
         max_pos_excess = max(2.0, x_lead_raw - d_want) if x_lead_raw < d_want else 1e8
-        damped_pos_excess = np.minimum(0.30 * np.maximum(0.0, obs_excess), max_pos_excess)
-        obs = np.where(obs_excess > 0.0, ref_comfort + damped_pos_excess, raw_obs)
+        damped_pos_excess = np.minimum(pos_gain * np.maximum(0.0, obs_delta), max_pos_excess)
+        obs = np.where(obs_delta > 0.0, ref_comfort + damped_pos_excess, raw_obs)
         lead_obstacles.append(obs)
       else:
         lead_obstacles.append(l_xv[:, 0] + get_stopped_equivalence_factor(l_xv[:, 1]))
@@ -402,7 +445,7 @@ class LongitudinalMpc:
     lead_xv_0, lead_xv_1 = lead_xvs
     lead_0_obstacle, lead_1_obstacle = lead_obstacles
 
-    c_max_a = 0.35 if (lead_active_0 and v_ego > 6.0 and d_rel_0 < 105.0) else CRUISE_MAX_ACCEL
+    c_max_a = CRUISE_MAX_ACCEL - w_hwy_0 * (CRUISE_MAX_ACCEL - 0.35) if (lead_active_0 and d_rel_0 < 105.0) else CRUISE_MAX_ACCEL
 
     # Fake an obstacle for cruise, this ensures smooth acceleration to set speed
     # when the leads are no factor.
