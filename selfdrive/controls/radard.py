@@ -138,16 +138,74 @@ def match_vision_to_track(v_ego: float, lead: capnp._DynamicStructReader, tracks
     return None
 
 
-def get_RadarState_from_vision(lead_msg: capnp._DynamicStructReader, v_ego: float, model_v_ego: float, lead_prob: float):
-  lead_v_rel_pred = lead_msg.v[0] - model_v_ego
+class VisionLeadFilter:
+  def __init__(self, tau: float = 0.45, dt: float = DT_MDL):
+    self.tau = tau
+    self.dt = dt
+    self.vrel_filt: float | None = None
+    self.last_drel: float | None = None
+
+  def reset(self):
+    self.vrel_filt = None
+    self.last_drel = None
+
+  def update(self, d_rel: float, vrel_raw: float) -> float:
+    if self.vrel_filt is None or self.last_drel is None or abs(d_rel - self.last_drel) > 8.0:
+      self.vrel_filt = vrel_raw
+    else:
+      alpha = self.dt / (self.tau + self.dt)
+      self.vrel_filt += alpha * (vrel_raw - self.vrel_filt)
+    self.last_drel = d_rel
+    return self.vrel_filt
+
+
+_DEFAULT_VISION_FILTER = VisionLeadFilter()
+
+
+def get_RadarState_from_vision(lead_msg: capnp._DynamicStructReader, v_ego: float, model_v_ego: float, lead_prob: float,
+                               a_ego: float | None = None, vision_filter: VisionLeadFilter | None = None):
+  d_rel = float(lead_msg.x[0] - RADAR_TO_CAMERA)
+  y_rel = float(-lead_msg.y[0]) if len(lead_msg.y) else 0.0
+  a_lead_raw = float(lead_msg.a[0])
+
+  # 1. Remove ego acceleration pitch/lag self-contamination (v_ego - model_v_ego ~ 0.67 * a_ego).
+  #    Gate negative a_ego de-biasing during real lead deceleration or low speed so hard stops have zero delay.
+  a_ego_est = float(a_ego) if a_ego is not None else float((v_ego - model_v_ego) / 0.67)
+  neg_lim = -0.40 * float(np.interp(v_ego, [18.0, 23.0], [0.0, 1.0])) * float(np.interp(a_lead_raw, [-0.55, -0.25], [0.0, 1.0]))
+  a_ego_corr = float(np.clip(a_ego_est, neg_lim, 1.5))
+  vrel_raw = float(lead_msg.v[0] - model_v_ego) - 0.95 * a_ego_corr
+  a_lead_clean = a_lead_raw - 0.35 * a_ego_corr
+
+  # 2. Symmetric 1st-order filter on vrel_raw (identical tau up/down, reset on track jump).
+  vf = _DEFAULT_VISION_FILTER if vision_filter is None else vision_filter
+  vrel = vf.update(d_rel, vrel_raw)
+
+  # 3. Uncertainty/sensitivity weighting for monocular vRel at highway speed and far range:
+  d_safe = 1.45 * v_ego + 6.0
+  if vrel >= 0.0:
+    w_gap = float(np.interp(d_rel / max(10.0, d_safe), [0.65, 1.02], [0.20, 1.0]))
+    w_hwy = float(np.interp(v_ego, [25.0, 29.5], [1.0, 0.50]))
+    scale = min(w_gap, w_hwy)
+    vrel_out = vrel * scale
+    a_lead_out = a_lead_clean * scale if a_lead_clean > 0.0 else a_lead_clean
+  else:
+    w_spd = float(np.interp(v_ego, [20.0, 28.0], [1.0, 0.50]))
+    w_dist = float(np.interp(d_rel, [22.0, 52.0, 95.0], [1.0, w_spd, 0.35]))
+    w_close = float(np.interp(d_rel, [38.0, 50.0], [1.0, 0.0]))
+    w_emerg = max(w_close, float(np.interp(a_lead_clean, [-0.80, -0.35], [1.0, 0.0])))
+    vrel_out = (1.0 - w_emerg) * (vrel * w_dist) + w_emerg * min(vrel_raw, vrel)
+    a_lead_out = a_lead_clean
+
+  a_tau = _LEAD_ACCEL_TAU if a_lead_out > -0.40 else 0.3
+  v_lead = max(0.0, v_ego + vrel_out)
   return {
-    "dRel": float(lead_msg.x[0] - RADAR_TO_CAMERA),
-    "yRel": float(-lead_msg.y[0]),
-    "vRel": float(lead_v_rel_pred),
-    "vLead": float(v_ego + lead_v_rel_pred),
-    "vLeadK": float(v_ego + lead_v_rel_pred),
-    "aLeadK": float(lead_msg.a[0]),
-    "aLeadTau": 0.3,
+    "dRel": d_rel,
+    "yRel": y_rel,
+    "vRel": float(v_lead - v_ego),
+    "vLead": float(v_lead),
+    "vLeadK": float(v_lead),
+    "aLeadK": float(a_lead_out),
+    "aLeadTau": float(a_tau),
     "fcw": False,
     "modelProb": float(lead_prob),
     "status": True,
@@ -157,7 +215,8 @@ def get_RadarState_from_vision(lead_msg: capnp._DynamicStructReader, v_ego: floa
 
 
 def get_lead(v_ego: float, ready: bool, tracks: dict[int, Track], lead_msg: capnp._DynamicStructReader,
-             model_v_ego: float, lead_prob: float, low_speed_override: bool = True) -> dict[str, Any]:
+             model_v_ego: float, lead_prob: float, low_speed_override: bool = True,
+             a_ego: float | None = None, vision_filter: VisionLeadFilter | None = None) -> dict[str, Any]:
   # Determine leads, this is where the essential logic happens
   if len(tracks) > 0 and ready and lead_prob > .5:
     track = match_vision_to_track(v_ego, lead_msg, tracks)
@@ -166,9 +225,13 @@ def get_lead(v_ego: float, ready: bool, tracks: dict[int, Track], lead_msg: capn
 
   lead_dict = {'status': False}
   if track is not None:
+    if vision_filter is not None:
+      vision_filter.reset()
     lead_dict = track.get_RadarState(lead_prob)
   elif (track is None) and ready and (lead_prob > .5):
-    lead_dict = get_RadarState_from_vision(lead_msg, v_ego, model_v_ego, lead_prob)
+    lead_dict = get_RadarState_from_vision(lead_msg, v_ego, model_v_ego, lead_prob, a_ego=a_ego, vision_filter=vision_filter)
+  elif vision_filter is not None:
+    vision_filter.reset()
 
   if low_speed_override:
     low_speed_tracks = [c for c in tracks.values() if c.potential_low_speed_lead(v_ego)]
@@ -189,8 +252,10 @@ class RadarD:
     self.tracks: dict[int, Track] = {}
     self.kalman_params = KalmanParams(DT_MDL)
     self.lead_prob_filters = [FirstOrderFilter(0.0, 0.2, DT_MDL) for _ in range(2)]
+    self.vision_filters = [VisionLeadFilter(0.45, DT_MDL) for _ in range(2)]
 
     self.v_ego = 0.0
+    self.a_ego = 0.0
     self.v_ego_hist = deque([0.0], maxlen=int(round(delay / DT_MDL))+1)
     self.last_v_ego_frame = -1
 
@@ -205,6 +270,7 @@ class RadarD:
 
     if sm.recv_frame['carState'] != self.last_v_ego_frame:
       self.v_ego = sm['carState'].vEgo
+      self.a_ego = sm['carState'].aEgo
       self.v_ego_hist.append(self.v_ego)
       self.last_v_ego_frame = sm.recv_frame['carState']
 
@@ -248,8 +314,10 @@ class RadarD:
         else:
           self.lead_prob_filters[i].update(lead_prob)
 
-      self.radar_state.leadOne = get_lead(self.v_ego, self.ready, self.tracks, leads_v3[0], model_v_ego, self.lead_prob_filters[0].x, low_speed_override=True)
-      self.radar_state.leadTwo = get_lead(self.v_ego, self.ready, self.tracks, leads_v3[1], model_v_ego, self.lead_prob_filters[1].x, low_speed_override=False)
+      self.radar_state.leadOne = get_lead(self.v_ego, self.ready, self.tracks, leads_v3[0], model_v_ego, self.lead_prob_filters[0].x,
+                                          low_speed_override=True, a_ego=self.a_ego, vision_filter=self.vision_filters[0])
+      self.radar_state.leadTwo = get_lead(self.v_ego, self.ready, self.tracks, leads_v3[1], model_v_ego, self.lead_prob_filters[1].x,
+                                          low_speed_override=False, a_ego=self.a_ego, vision_filter=self.vision_filters[1])
 
   def publish(self, pm: messaging.PubMaster):
     assert self.radar_state is not None
