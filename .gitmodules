@@ -17,3 +17,7 @@
   path = tinygrad_repo
   url = https://github.com/tinygrad/tinygrad.git
   branch = master
+[submodule "opendbc_repo"]
+	url = https://github.com/chorca/opendbc
+	branch = 0112-honda-ports
+	path = opendbc_repo
