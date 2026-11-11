@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import os
 import time
 import numpy as np
 
@@ -48,10 +49,16 @@ class Plant:
     time.sleep(0.1)
     self.sm = messaging.SubMaster(['longitudinalPlan'])
 
+    from opendbc.car import gen_empty_fingerprint
     from opendbc.car.honda.values import CAR
     from opendbc.car.honda.interface import CarInterface
 
-    self.planner = LongitudinalPlanner(CarInterface.get_non_essential_params(CAR.HONDA_CIVIC), init_v=self.speed)
+    car_name = os.getenv("MANEUVER_CAR")
+    if car_name:
+      cp = CarInterface.get_params(getattr(CAR, car_name), gen_empty_fingerprint(), [], True, False, False)
+    else:
+      cp = CarInterface.get_non_essential_params(CAR.HONDA_CIVIC)
+    self.planner = LongitudinalPlanner(cp, init_v=self.speed)
 
   @property
   def current_time(self):

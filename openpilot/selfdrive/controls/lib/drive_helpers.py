@@ -12,9 +12,13 @@ MIN_STABLE_DELAY = 0.3
 MAX_LATERAL_JERK = 5.0  # m/s^3
 MAX_LATERAL_ACCEL_NO_ROLL = 3.0  # m/s^2
 
+V_EGO_STOPPING = 0.3
+V_EGO_KEEP_STOPPING = 0.8
 
-def should_stop(v_ego: float, a_target: float) -> bool:
-  return bool(v_ego < 0.3 and a_target < 0.1)
+
+def should_stop(v_ego: float, a_target: float, keep_stopping: bool = False) -> bool:
+  v_stopping = V_EGO_KEEP_STOPPING if keep_stopping else V_EGO_STOPPING
+  return bool(v_ego < v_stopping and a_target < 0.1)
 
 def clamp(val, min_val, max_val):
   clamped_val = float(np.clip(val, min_val, max_val))
