@@ -134,7 +134,7 @@ def match_vision_to_track(v_ego: float, lead: capnp._DynamicStructReader, tracks
 
 
 class VisionLeadFilter:
-  def __init__(self, tau: float = 0.45, dt: float = DT_MDL):
+  def __init__(self, tau: float = 0.35, dt: float = DT_MDL):
     self.tau = tau
     self.dt = dt
     self.vrel_filt: float | None = None
@@ -163,31 +163,25 @@ def get_RadarState_from_vision(lead_msg: capnp._DynamicStructReader, v_ego: floa
   y_rel = float(-lead_msg.y[0]) if len(lead_msg.y) else 0.0
   a_lead_raw = float(lead_msg.a[0])
 
-  # 1. Remove ego acceleration camera-pitch/lag self-contamination (v_ego - model_v_ego ~ 0.67 * a_ego).
-  #    Gate negative a_ego de-biasing during real lead deceleration or low speed so hard stops have zero delay.
+  # 1. Remove ego acceleration camera-pitch/lag self-contamination across both acceleration and mild highway braking,
+  #    gated off below 18 m/s or during real lead braking (a_lead_raw <= -0.80) so hard stops have zero delay.
   a_ego_est = float(a_ego) if a_ego is not None else float((v_ego - model_v_ego) / 0.67)
-  neg_lim = -0.40 * float(np.interp(v_ego, [18.0, 23.0], [0.0, 1.0])) * float(np.interp(a_lead_raw, [-0.55, -0.25], [0.0, 1.0]))
+  neg_lim = -1.10 * float(np.interp(v_ego, [18.0, 23.0], [0.0, 1.0])) * float(np.interp(a_lead_raw, [-0.80, -0.45], [0.0, 1.0]))
   a_ego_corr = float(np.clip(a_ego_est, neg_lim, 1.5))
-  vrel_raw = float(lead_msg.v[0] - model_v_ego) - 0.95 * a_ego_corr
+  vrel_raw = float(lead_msg.v[0] - model_v_ego) - 1.10 * a_ego_corr
   a_lead_clean = a_lead_raw - 0.35 * a_ego_corr
 
-  # 2. Symmetric 1st-order filter on vrel_raw (identical tau up/down, reset on >8 m target jump).
+  # 2. Symmetric 1st-order filter on vrel_raw (identical tau up/down, no sign-asymmetric w_hwy/w_close bias),
+  #    with fast raw-min blend only during genuine lead deceleration (a_lead_clean < -0.40).
   vf = _DEFAULT_VISION_FILTER if vision_filter is None else vision_filter
   vrel = vf.update(d_rel, vrel_raw)
-
-  # 3. Opening-only highway ego-speed leak discount (no low-speed w_gap launch suppression,
-  #    no negative-vRel w_dist closing suppression; fast raw-min emergency blend preserved).
-  if vrel >= 0.0:
-    w_hwy = float(np.interp(v_ego, [25.0, 29.5], [1.0, 0.50]))
-    vrel_out = vrel * w_hwy
-    a_lead_out = a_lead_clean * w_hwy if a_lead_clean > 0.0 else a_lead_clean
-    a_tau = 0.3 if a_lead_clean > 0.0 else (_LEAD_ACCEL_TAU if a_lead_out > -0.40 else 0.3)
-  else:
-    w_close = float(np.interp(d_rel, [38.0, 50.0], [1.0, 0.0]))
-    w_emerg = max(w_close, float(np.interp(a_lead_clean, [-0.80, -0.35], [1.0, 0.0])))
+  if vrel < 0.0 and a_lead_clean < -0.40:
+    w_emerg = float(np.interp(a_lead_clean, [-0.80, -0.40], [1.0, 0.0]))
     vrel_out = (1.0 - w_emerg) * vrel + w_emerg * min(vrel_raw, vrel)
-    a_lead_out = a_lead_clean
-    a_tau = _LEAD_ACCEL_TAU if a_lead_out > -0.40 else 0.3
+  else:
+    vrel_out = vrel
+  a_lead_out = a_lead_clean
+  a_tau = 0.3 if (a_lead_out > 0.0 or a_lead_out <= -0.40) else _LEAD_ACCEL_TAU
 
   v_lead = max(0.0, v_ego + vrel_out)
   return {
@@ -241,7 +235,7 @@ class RadarD:
     self.tracks: dict[int, Track] = {}
     self.kalman_params = KalmanParams(DT_MDL)
     self.lead_prob_filters = [FirstOrderFilter(0.0, 0.2, DT_MDL) for _ in range(2)]
-    self.vision_filters = [VisionLeadFilter(0.45, DT_MDL) for _ in range(2)]
+    self.vision_filters = [VisionLeadFilter(0.35, DT_MDL) for _ in range(2)]
 
     self.v_ego = 0.0
     self.a_ego = 0.0

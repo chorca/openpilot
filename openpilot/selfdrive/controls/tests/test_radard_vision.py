@@ -57,16 +57,28 @@ class TestRadardVision(unittest.TestCase):
     self.assertAlmostEqual(out["aLeadK"], 0.8, places=6)
     self.assertAlmostEqual(out["aLeadTau"], 0.3, places=6)
 
-  def test_highway_opening_w_hwy_and_a_ego_debias(self):
-    vf = VisionLeadFilter()
-    # At 31 m/s (> 29.5 m/s), a_ego = +1.0 m/s^2 surge: de-bias removes +0.95*a_ego and +0.35*a_ego, then w_hwy = 0.50
-    lead_msg = _make_lead_msg(x=50.0 + RADAR_TO_CAMERA, v=33.95, a=0.75)
-    out = get_RadarState_from_vision(lead_msg, v_ego=31.0, model_v_ego=31.0, lead_prob=0.95, a_ego=1.0, vision_filter=vf)
-    # vrel_raw = (33.95 - 31.0) - 0.95 = 2.0 -> * 0.50 = 1.0
-    # a_lead_clean = 0.75 - 0.35 = 0.40 -> * 0.50 = 0.20, aLeadTau = 0.3 (since a_lead_clean > 0)
-    self.assertAlmostEqual(out["vRel"], 1.0, places=5)
-    self.assertAlmostEqual(out["aLeadK"], 0.20, places=5)
-    self.assertAlmostEqual(out["aLeadTau"], 0.3, places=5)
+  def test_highway_symmetric_a_ego_debias_accel_and_mild_brake(self):
+    # 1. Highway acceleration surge (+1.0 m/s^2 at 31 m/s): removes +1.10*a_ego and +0.35*a_ego without w_hwy opening suppression
+    vf_acc = VisionLeadFilter()
+    lead_acc = _make_lead_msg(x=50.0 + RADAR_TO_CAMERA, v=34.10, a=0.75)
+    out_acc = get_RadarState_from_vision(lead_acc, v_ego=31.0, model_v_ego=31.0, lead_prob=0.95, a_ego=1.0, vision_filter=vf_acc)
+    self.assertAlmostEqual(out_acc["vRel"], 2.0, places=5)
+    self.assertAlmostEqual(out_acc["aLeadK"], 0.40, places=5)
+    self.assertAlmostEqual(out_acc["aLeadTau"], 0.3, places=5)
+
+    # 2. Highway mild braking (-0.8 m/s^2 at 27 m/s behind non-braking lead a=0.0): removes nose-dive pitch leak symmetrically
+    vf_brk = VisionLeadFilter()
+    lead_steady = _make_lead_msg(x=35.0 + RADAR_TO_CAMERA, v=26.12, a=0.0)
+    out_brk = get_RadarState_from_vision(lead_steady, v_ego=27.0, model_v_ego=27.0, lead_prob=0.98, a_ego=-0.8, vision_filter=vf_brk)
+    # vrel_raw = (26.12 - 27.0) - 1.10 * (-0.8) = 0.0
+    self.assertAlmostEqual(out_brk["vRel"], 0.0, places=5)
+    self.assertAlmostEqual(out_brk["aLeadK"], 0.28, places=5)
+
+    # 3. Exact zero-crossing symmetry at highway speed (no sign-dependent vRel gain kink around vRel = 0)
+    vf_p, vf_n = VisionLeadFilter(), VisionLeadFilter()
+    out_p = get_RadarState_from_vision(_make_lead_msg(42.0 + RADAR_TO_CAMERA, 29.5, 0.0), 28.0, 28.0, 0.99, a_ego=0.0, vision_filter=vf_p)
+    out_n = get_RadarState_from_vision(_make_lead_msg(42.0 + RADAR_TO_CAMERA, 26.5, 0.0), 28.0, 28.0, 0.99, a_ego=0.0, vision_filter=vf_n)
+    self.assertAlmostEqual(out_p["vRel"], -out_n["vRel"], places=6)
 
   def test_closing_no_distance_attenuation_and_hard_stop_gate(self):
     vf = VisionLeadFilter()
@@ -76,7 +88,7 @@ class TestRadardVision(unittest.TestCase):
     self.assertAlmostEqual(out_far["vRel"], -3.0, places=5)
     self.assertAlmostEqual(out_far["aLeadTau"], _LEAD_ACCEL_TAU, places=5)
 
-    # Hard lead braking (a_lead_raw = -1.2 <= -0.55) while ego also brakes (a_ego = -2.0): neg_lim = 0.0 -> zero positive boost
+    # Hard lead braking (a_lead_raw = -1.2 <= -0.80) while ego also brakes (a_ego = -2.0): neg_lim = 0.0 -> zero positive boost
     vf_brk = VisionLeadFilter()
     lead_brk = _make_lead_msg(x=25.0 + RADAR_TO_CAMERA, v=15.0, a=-1.2)
     out_brk = get_RadarState_from_vision(lead_brk, v_ego=20.0, model_v_ego=20.0, lead_prob=0.99, a_ego=-2.0, vision_filter=vf_brk)
